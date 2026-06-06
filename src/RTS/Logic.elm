@@ -1,200 +1,28 @@
-module RTS.Logic exposing (init, update)
+module RTS.Logic exposing (..)
 
-{-| Game rules for the RTS: the initial world, and a pure `update` that advances it for each message
-(including the real-time `Tick`). No rendering and no effects — `RTS.Main` wraps this in a
-`Browser.element` and `RTS.View` draws the resulting `Model`.
+{-| Pure game mechanics, shared by the live game (`RTS.Game`) and the opponent AI (`RTS.Ai`):
+pathfinding, movement and chasing, combat resolution, resource gathering, fog of war, the
+owner-parameterised command/build/train helpers, and the per-player "power" used for scoring and the
+results chart.
+
+Everything here is a pure `Model -> something` function — no `update`, no AI and no effects — so the
+orchestration layer can compose the steps in one place and the test suite can exercise each in
+isolation. Resources are per-player, and every unit/building carries an `owner`, so all of these are
+written to work for any player, human or AI.
 -}
 
+import Dict exposing (Dict)
 import RTS.Model exposing (..)
-
-
-{-| The starting world: a generated map, a base with one worker, and some gold to spend. -}
-init : Model
-init =
-    let
-        tiles =
-            List.concatMap
-                (\y -> List.map (\x -> { x = x, y = y, terrain = terrainAt x y, visible = False }) (List.range 0 (mapWidth - 1)))
-                (List.range 0 (mapHeight - 1))
-
-        base =
-            { x = 2, y = 2, kind = Base }
-
-        worker =
-            { id = 1, x = 2, y = 3, tx = 2, ty = 3, kind = Worker, carrying = 0, assigned = Nothing }
-
-        start =
-            { map = tiles
-            , units = [ worker ]
-            , buildings = [ base ]
-            , gold = 150
-            , wood = 0
-            , selected = Just 1
-            , nextId = 2
-            , mode = Normal
-            , tick = 0
-            , status = Playing
-            , message = "Send workers onto gold/forest to gather; explore the whole map to win."
-            }
-    in
-    { start | map = revealAround start }
-
-
-{-| Deterministic terrain so the map is interesting without needing randomness. -}
-terrainAt : Int -> Int -> Terrain
-terrainAt x y =
-    if x >= 8 && x <= 10 && y >= 4 && y <= 7 then
-        Water
-
-    else if (x == 14 && y == 2) || (x == 16 && y == 9) || (x == 5 && y == 11) then
-        GoldMine
-
-    else if modBy 7 (x * 3 + y * 5) == 0 && (x > 3 || y > 3) then
-        Rock
-
-    else if modBy 3 (x + y * 2) == 0 && (x > 4 || y > 4) then
-        Forest
-
-    else
-        Grass
-
-
-update : Msg -> Model -> Model
-update msg model =
-    case msg of
-        Tick ->
-            tickGame model
-
-        SelectUnit id ->
-            { model | selected = Just id, message = "Unit selected — click a tile to move it." }
-
-        ClickTile x y ->
-            clickTile x y model
-
-        TrainWorker ->
-            trainWorker model
-
-        TrainSoldier ->
-            trainSoldier model
-
-        StartBarracks ->
-            startPlacing Barracks model
-
-        StartFarm ->
-            startPlacing Farm model
-
-        Cancel ->
-            { model | mode = Normal, selected = Nothing, message = "" }
-
-
-
--- THE REAL-TIME STEP -----------------------------------------------------------------------------
-
-
-tickGame : Model -> Model
-tickGame model =
-    case model.status of
-        Playing ->
-            tickPlaying model
-
-        _ ->
-            model
-
-
-tickPlaying : Model -> Model
-tickPlaying model =
-    let
-        moved =
-            List.map (moveUnit model) model.units
-
-        ( workedUnits, goldGain, woodGain ) =
-            List.foldr (gatherStep model) ( [], 0, 0 ) moved
-
-        gained =
-            { model
-                | units = workedUnits
-                , gold = model.gold + goldGain
-                , wood = model.wood + woodGain
-                , tick = model.tick + 1
-            }
-
-        revealed =
-            revealAround gained
-
-        allVisible =
-            List.all (\t -> t.visible) revealed
-
-        status =
-            if allVisible then
-                Won
-
-            else if gained.tick >= tickLimit then
-                Lost
-
-            else
-                Playing
-    in
-    { gained
-        | map = revealed
-        , status = status
-        , message =
-            case status of
-                Won ->
-                    "Victory — the whole map is explored!"
-
-                Lost ->
-                    "Out of time — explore faster next run!"
-
-                Playing ->
-                    gained.message
-    }
-
-
-{-| Moves a unit a small step toward its target. While it's still in a different tile from the goal
-it heads toward the next tile on a breadth-first path that routes *around* impassable water/rock;
-once in the goal tile it homes in on the exact target point. -}
-moveUnit : Model -> Unit -> Unit
-moveUnit model u =
-    let
-        dist =
-            distance u.x u.y u.tx u.ty
-    in
-    if dist <= speed then
-        { u | x = u.tx, y = u.ty }
-
-    else
-        let
-            cur =
-                ( round u.x, round u.y )
-
-            goal =
-                ( round u.tx, round u.ty )
-
-            ( gx, gy ) =
-                if cur == goal then
-                    ( u.tx, u.ty )
-
-                else
-                    case nextStep model cur goal of
-                        Just ( sx, sy ) ->
-                            ( toFloat sx, toFloat sy )
-
-                        Nothing ->
-                            ( u.x, u.y )
-
-            step =
-                distance u.x u.y gx gy
-        in
-        if step <= speed then
-            { u | x = gx, y = gy }
-
-        else
-            { u | x = u.x + speed * (gx - u.x) / step, y = u.y + speed * (gy - u.y) / step }
+import Set exposing (Set)
 
 
 speed : Float
 speed =
-    0.2
+    0.18
+
+
+
+-- GEOMETRY -------------------------------------------------------------------------------------
 
 
 distance : Float -> Float -> Float -> Float -> Float
@@ -202,230 +30,13 @@ distance ax ay bx by =
     sqrt ((bx - ax) * (bx - ax) + (by - ay) * (by - ay))
 
 
-{-| The next tile to step to on a shortest passable path from `start` to `goal` (4-directional BFS),
-or `Nothing` if no path exists. -}
-nextStep : Model -> ( Int, Int ) -> ( Int, Int ) -> Maybe ( Int, Int )
-nextStep model start goal =
-    if start == goal then
-        Just goal
-
-    else
-        let
-            ring =
-                passableNeighbors model goal start
-        in
-        bfs model goal (List.map (\n -> ( n, n )) ring) (start :: ring)
-
-
-bfs : Model -> ( Int, Int ) -> List ( ( Int, Int ), ( Int, Int ) ) -> List ( Int, Int ) -> Maybe ( Int, Int )
-bfs model goal queue visited =
-    case queue of
-        [] ->
-            Nothing
-
-        ( tile, first ) :: rest ->
-            if tile == goal then
-                Just first
-
-            else
-                let
-                    ns =
-                        List.filter (\n -> not (List.member n visited)) (passableNeighbors model goal tile)
-                in
-                bfs model goal (rest ++ List.map (\n -> ( n, first )) ns) (visited ++ ns)
-
-
-{-| In-bounds 4-neighbours that are passable (the `goal` is always allowed, so a worker can step onto
-a resource tile even though it's the destination). -}
-passableNeighbors : Model -> ( Int, Int ) -> ( Int, Int ) -> List ( Int, Int )
-passableNeighbors model goal ( x, y ) =
-    List.filter
-        (\( nx, ny ) ->
-            nx >= 0 && nx < mapWidth && ny >= 0 && ny < mapHeight && (( nx, ny ) == goal || passableAt nx ny model)
-        )
-        [ ( x + 1, y ), ( x - 1, y ), ( x, y + 1 ), ( x, y - 1 ) ]
-
-
-{-| Clears the fog around every unit and building (Chebyshev distance ≤ `revealRadius`). -}
-revealAround : Model -> List Tile
-revealAround model =
-    let
-        sources =
-            List.map (\b -> ( b.x, b.y )) model.buildings
-                ++ List.map (\u -> ( round u.x, round u.y )) model.units
-
-        near t ( sx, sy ) =
-            abs (t.x - sx) <= revealRadius && abs (t.y - sy) <= revealRadius
-    in
-    List.map
-        (\t ->
-            if t.visible || List.any (near t) sources then
-                { t | visible = True }
-
-            else
-                t
-        )
-        model.map
+unitDistance : Unit -> Unit -> Float
+unitDistance a b =
+    distance a.x a.y b.x b.y
 
 
 
--- CLICKS & COMMANDS ------------------------------------------------------------------------------
-
-
-clickTile : Int -> Int -> Model -> Model
-clickTile x y model =
-    case model.mode of
-        Placing kind ->
-            placeBuilding kind x y model
-
-        Normal ->
-            case model.selected of
-                Just id ->
-                    if passableAt x y model then
-                        { model
-                            | units =
-                                List.map
-                                    (\u ->
-                                        if u.id == id then
-                                            retarget x y model u
-
-                                        else
-                                            u
-                                    )
-                                    model.units
-                            , message =
-                                if isResourceAt x y model then
-                                    "Worker assigned to gather — it will haul loads back to the base."
-
-                                else
-                                    ""
-                        }
-
-                    else
-                        { model | message = "That tile is impassable." }
-
-                Nothing ->
-                    { model | message = "Select a unit first." }
-
-
-placeBuilding : BuildingKind -> Int -> Int -> Model -> Model
-placeBuilding kind x y model =
-    if model.gold < barracksCost then
-        { model | mode = Normal, message = "Not enough gold to build." }
-
-    else if not (passableAt x y model) || occupied x y model then
-        { model | message = "Pick a clear, passable tile." }
-
-    else
-        { model
-            | buildings = { x = x, y = y, kind = kind } :: model.buildings
-            , gold = model.gold - barracksCost
-            , mode = Normal
-            , message = buildingLabel kind ++ " built."
-        }
-
-
-startPlacing : BuildingKind -> Model -> Model
-startPlacing kind model =
-    if model.gold < barracksCost then
-        { model | message = "Need " ++ String.fromInt barracksCost ++ " gold for a " ++ buildingLabel kind ++ "." }
-
-    else
-        { model | mode = Placing kind, message = "Click a clear tile to place the " ++ buildingLabel kind ++ "." }
-
-
-trainWorker : Model -> Model
-trainWorker model =
-    spawnUnit Worker workerCost isBase "Worker" model
-
-
-trainSoldier : Model -> Model
-trainSoldier model =
-    spawnUnit Soldier soldierCost isBarracks "Soldier" model
-
-
-{-| Spawns a unit next to the first building matching `atBuilding`, if affordable. -}
-spawnUnit : UnitKind -> Int -> (BuildingKind -> Bool) -> String -> Model -> Model
-spawnUnit kind cost atBuilding name model =
-    case findBuilding atBuilding model of
-        Nothing ->
-            { model | message = "Build the right structure first to train a " ++ name ++ "." }
-
-        Just ( bx, by ) ->
-            if model.gold < cost then
-                { model | message = "Need " ++ String.fromInt cost ++ " gold for a " ++ name ++ "." }
-
-            else
-                let
-                    sx =
-                        toFloat bx
-
-                    sy =
-                        toFloat (by + 1)
-                in
-                { model
-                    | units = { id = model.nextId, x = sx, y = sy, tx = sx, ty = sy, kind = kind, carrying = 0, assigned = Nothing } :: model.units
-                    , gold = model.gold - cost
-                    , nextId = model.nextId + 1
-                    , selected = Just model.nextId
-                    , message = name ++ " trained."
-                }
-
-
-
--- QUERIES ----------------------------------------------------------------------------------------
-
-
-{-| Points a unit at a tile; a worker sent to a resource tile is `assigned` to gather it, while a
-worker sent elsewhere (or any soldier) just walks there. -}
-retarget : Int -> Int -> Model -> Unit -> Unit
-retarget x y model u =
-    case u.kind of
-        Worker ->
-            { u
-                | tx = toFloat x
-                , ty = toFloat y
-                , assigned =
-                    if isResourceAt x y model then
-                        Just ( x, y )
-
-                    else
-                        Nothing
-            }
-
-        Soldier ->
-            { u | tx = toFloat x, ty = toFloat y }
-
-
-isResourceAt : Int -> Int -> Model -> Bool
-isResourceAt x y model =
-    case lookupTerrain x y model of
-        Just terrain ->
-            isGold terrain || isForest terrain
-
-        Nothing ->
-            False
-
-
-passableAt : Int -> Int -> Model -> Bool
-passableAt x y model =
-    case lookupTerrain x y model of
-        Just Water ->
-            False
-
-        Just Rock ->
-            False
-
-        Just _ ->
-            True
-
-        Nothing ->
-            False
-
-
-occupied : Int -> Int -> Model -> Bool
-occupied x y model =
-    List.any (\b -> b.x == x && b.y == y) model.buildings
+-- TERRAIN / OCCUPANCY --------------------------------------------------------------------------
 
 
 lookupTerrain : Int -> Int -> Model -> Maybe Terrain
@@ -443,41 +54,479 @@ lookupTerrain x y model =
         )
 
 
-{-| Advances a single unit's gather loop, threading the gold/wood deposited this tick:
+passableAt : Int -> Int -> Model -> Bool
+passableAt x y model =
+    case lookupTerrain x y model of
+        Just terrain ->
+            passableTerrain terrain
 
-  - on the base with a load: deposit it (into gold or wood, per the assigned resource) and head back;
-  - full: walk to the base to unload;
-  - standing on its assigned resource: keep filling up;
-  - otherwise: nothing.
+        Nothing ->
+            False
 
-Soldiers pass through unchanged. -}
-gatherStep : Model -> Unit -> ( List Unit, Int, Int ) -> ( List Unit, Int, Int )
-gatherStep model u ( us, g, w ) =
-    case u.kind of
-        Soldier ->
-            ( u :: us, g, w )
 
-        Worker ->
-            if atBase u model && u.carrying > 0 then
-                let
-                    ( dg, dw ) =
-                        deposit u model
-                in
-                ( resume u :: us, g + dg, w + dw )
+inBounds : Int -> Int -> Model -> Bool
+inBounds x y model =
+    x >= 0 && x < model.width && y >= 0 && y < model.height
 
-            else if u.carrying >= carryCap then
-                ( sendHome u model :: us, g, w )
 
-            else if onAssignedResource u model then
-                ( { u | carrying = min carryCap (u.carrying + gatherRate) } :: us, g, w )
+occupiedByBuilding : Int -> Int -> Model -> Bool
+occupiedByBuilding x y model =
+    List.any (\b -> b.x == x && b.y == y) model.buildings
+
+
+isResourceAt : Int -> Int -> Model -> Bool
+isResourceAt x y model =
+    case lookupTerrain x y model of
+        Just GoldMine ->
+            True
+
+        Just Forest ->
+            True
+
+        _ ->
+            False
+
+
+isForestAt : Int -> Int -> Model -> Bool
+isForestAt x y model =
+    lookupTerrain x y model == Just Forest
+
+
+
+-- PATHFINDING ----------------------------------------------------------------------------------
+
+
+{-| A breadth-first shortest path of tiles from `start` to `goal` (4-directional), excluding `start`
+and ending at `goal`. Impassable terrain and tiles occupied by buildings are avoided, except the goal
+itself is always allowed (so a worker can path onto a resource and a soldier onto an enemy building).
+Returns `[]` when no path exists. Exploration is bounded so a sealed-off goal can't loop forever. -}
+findPath : Model -> ( Int, Int ) -> ( Int, Int ) -> List ( Int, Int )
+findPath model start goal =
+    if start == goal then
+        []
+
+    else
+        let
+            walkable pos =
+                pos == goal || passableTile model pos
+        in
+        bfs goal walkable [ ( start, [] ) ] (Set.singleton start) 3000
+
+
+passableTile : Model -> ( Int, Int ) -> Bool
+passableTile model ( x, y ) =
+    inBounds x y model && passableAt x y model && not (occupiedByBuilding x y model)
+
+
+bfs : ( Int, Int ) -> (( Int, Int ) -> Bool) -> List ( ( Int, Int ), List ( Int, Int ) ) -> Set ( Int, Int ) -> Int -> List ( Int, Int )
+bfs goal walkable queue visited budget =
+    case queue of
+        [] ->
+            []
+
+        ( tile, pathRev ) :: rest ->
+            if tile == goal then
+                List.reverse pathRev
+
+            else if budget <= 0 then
+                []
 
             else
-                ( u :: us, g, w )
+                let
+                    ns =
+                        List.filter
+                            (\n -> walkable n && not (Set.member n visited))
+                            (neighbors4 tile)
+
+                    visited2 =
+                        List.foldl Set.insert visited ns
+
+                    queue2 =
+                        rest ++ List.map (\n -> ( n, n :: pathRev )) ns
+                in
+                bfs goal walkable queue2 visited2 (budget - 1)
 
 
-{-| A worker's load as (gold, wood): gold from a mine, wood from a forest (gold by default). -}
-deposit : Unit -> Model -> ( Int, Int )
-deposit u model =
+neighbors4 : ( Int, Int ) -> List ( Int, Int )
+neighbors4 ( x, y ) =
+    [ ( x + 1, y ), ( x - 1, y ), ( x, y + 1 ), ( x, y - 1 ) ]
+
+
+
+-- MOVEMENT & CHASING ---------------------------------------------------------------------------
+
+
+{-| Advance every unit one step: chasers head for (and stop in range of) their target, others follow
+their stored path toward `tx`/`ty`. -}
+moveUnits : Model -> List Unit
+moveUnits model =
+    List.map (stepUnit model) model.units
+
+
+stepUnit : Model -> Unit -> Unit
+stepUnit model u =
+    case u.attack of
+        Just tid ->
+            case targetPos tid model of
+                Just ( txp, typ ) ->
+                    if distance u.x u.y txp typ <= attackRange u.kind then
+                        -- In range: hold position and let combat do the rest.
+                        { u | path = [], tx = u.x, ty = u.y }
+
+                    else
+                        advance (ensureChasePath model u ( round txp, round typ ))
+
+                Nothing ->
+                    -- Target gone; drop the order and stand still.
+                    advance { u | attack = Nothing, path = [], tx = u.x, ty = u.y }
+
+        Nothing ->
+            advance u
+
+
+{-| Keep a chaser's path pointed at its (moving) target: recompute when the path is empty or on a
+staggered cadence, so a long chase isn't re-planned every single tick. -}
+ensureChasePath : Model -> Unit -> ( Int, Int ) -> Unit
+ensureChasePath model u goal =
+    let
+        due =
+            List.isEmpty u.path || modBy 8 (model.tick + u.id) == 0
+    in
+    if due then
+        { u | path = findPath model ( round u.x, round u.y ) goal, tx = toFloat (Tuple.first goal), ty = toFloat (Tuple.second goal) }
+
+    else
+        u
+
+
+advance : Unit -> Unit
+advance u =
+    case u.path of
+        [] ->
+            homeIn u
+
+        ( wx, wy ) :: rest ->
+            let
+                gx =
+                    toFloat wx
+
+                gy =
+                    toFloat wy
+
+                d =
+                    distance u.x u.y gx gy
+            in
+            if d <= speed then
+                { u | x = gx, y = gy, path = rest }
+
+            else
+                { u | x = u.x + speed * (gx - u.x) / d, y = u.y + speed * (gy - u.y) / d }
+
+
+homeIn : Unit -> Unit
+homeIn u =
+    let
+        d =
+            distance u.x u.y u.tx u.ty
+    in
+    if d <= speed then
+        { u | x = u.tx, y = u.ty }
+
+    else
+        { u | x = u.x + speed * (u.tx - u.x) / d, y = u.y + speed * (u.ty - u.y) / d }
+
+
+
+-- COMBAT ---------------------------------------------------------------------------------------
+
+
+type alias Hit =
+    { target : Int
+    , owner : PlayerId
+    , dmg : Int
+    }
+
+
+{-| Resolve one tick of combat: every unit whose attack is off cooldown and whose target is in range
+deals damage. Returns the surviving units (cooldowns ticked, dead removed), the surviving buildings,
+and the players with kill counts credited for anything destroyed this tick. -}
+resolveCombat : Model -> ( List Unit, List Building, List Player )
+resolveCombat model =
+    let
+        hits =
+            List.filterMap (attackHit model) model.units
+
+        dmgByTarget =
+            List.foldl (\h d -> Dict.update h.target (\cur -> Just (Maybe.withDefault 0 cur + h.dmg)) d) Dict.empty hits
+
+        ownerByTarget =
+            List.foldl (\h d -> Dict.insert h.target h.owner d) Dict.empty hits
+
+        -- Units: tick cooldowns, take damage, drop the dead.
+        units2 =
+            List.filterMap
+                (\u ->
+                    let
+                        cooled =
+                            if memberFired u.id model hits then
+                                { u | cooldown = attackCooldown u.kind }
+
+                            else
+                                { u | cooldown = max 0 (u.cooldown - 1) }
+
+                        hp2 =
+                            cooled.hp - Maybe.withDefault 0 (Dict.get u.id dmgByTarget)
+                    in
+                    if hp2 <= 0 then
+                        Nothing
+
+                    else
+                        Just { cooled | hp = hp2 }
+                )
+                model.units
+
+        buildings2 =
+            List.filterMap
+                (\b ->
+                    let
+                        hp2 =
+                            b.hp - Maybe.withDefault 0 (Dict.get b.id dmgByTarget)
+                    in
+                    if hp2 <= 0 then
+                        Nothing
+
+                    else
+                        Just { b | hp = hp2 }
+                )
+                model.buildings
+
+        deadIds =
+            deaths model.units units2 ++ deaths2 model.buildings buildings2
+
+        players2 =
+            List.map
+                (\p ->
+                    let
+                        credited =
+                            List.length (List.filter (\did -> Dict.get did ownerByTarget == Just p.id) deadIds)
+                    in
+                    { p | kills = p.kills + credited }
+                )
+                model.players
+    in
+    ( units2, buildings2, players2 )
+
+
+{-| The damage event a unit produces this tick, if any: it must have a target, be off cooldown, and
+have that target within strike range. -}
+attackHit : Model -> Unit -> Maybe Hit
+attackHit model u =
+    case u.attack of
+        Just tid ->
+            if u.cooldown > 0 then
+                Nothing
+
+            else
+                case targetPos tid model of
+                    Just ( tx, ty ) ->
+                        if distance u.x u.y tx ty <= attackRange u.kind then
+                            Just { target = tid, owner = u.owner, dmg = attackDamage u.kind }
+
+                        else
+                            Nothing
+
+                    Nothing ->
+                        Nothing
+
+        Nothing ->
+            Nothing
+
+
+memberFired : Int -> Model -> List Hit -> Bool
+memberFired uid model hits =
+    -- A unit "fired" if it produced a hit this tick (so its cooldown resets).
+    List.any (\u -> u.id == uid) (List.filter (\u -> attackHit model u /= Nothing) model.units)
+
+
+{-| The world position of a target id, whether it's a unit or a building. -}
+targetPos : Int -> Model -> Maybe ( Float, Float )
+targetPos tid model =
+    case List.head (List.filter (\u -> u.id == tid) model.units) of
+        Just u ->
+            Just ( u.x, u.y )
+
+        Nothing ->
+            case List.head (List.filter (\b -> b.id == tid) model.buildings) of
+                Just b ->
+                    Just ( toFloat b.x, toFloat b.y )
+
+                Nothing ->
+                    Nothing
+
+
+deaths : List Unit -> List Unit -> List Int
+deaths before after =
+    let
+        survivors =
+            Set.fromList (List.map .id after)
+    in
+    List.filterMap
+        (\u ->
+            if Set.member u.id survivors then
+                Nothing
+
+            else
+                Just u.id
+        )
+        before
+
+
+deaths2 : List Building -> List Building -> List Int
+deaths2 before after =
+    let
+        survivors =
+            Set.fromList (List.map .id after)
+    in
+    List.filterMap
+        (\b ->
+            if Set.member b.id survivors then
+                Nothing
+
+            else
+                Just b.id
+        )
+        before
+
+
+
+-- AUTO-ACQUIRE ---------------------------------------------------------------------------------
+
+
+{-| Idle soldiers (no orders, no target) auto-engage the nearest enemy within aggro range. -}
+autoAcquire : Model -> List Unit
+autoAcquire model =
+    List.map
+        (\u ->
+            case ( u.kind, u.attack, u.path ) of
+                ( Soldier, Nothing, [] ) ->
+                    case nearestEnemyTarget model u of
+                        Just tid ->
+                            { u | attack = Just tid }
+
+                        Nothing ->
+                            u
+
+                _ ->
+                    u
+        )
+        model.units
+
+
+{-| The id of the closest enemy unit or building within `aggroRange` of `u`, if any. -}
+nearestEnemyTarget : Model -> Unit -> Maybe Int
+nearestEnemyTarget model u =
+    let
+        unitTargets =
+            List.filterMap
+                (\e ->
+                    if e.owner /= u.owner && unitDistance u e <= aggroRange then
+                        Just ( e.id, unitDistance u e )
+
+                    else
+                        Nothing
+                )
+                model.units
+
+        buildingTargets =
+            List.filterMap
+                (\b ->
+                    let
+                        d =
+                            distance u.x u.y (toFloat b.x) (toFloat b.y)
+                    in
+                    if b.owner /= u.owner && d <= aggroRange then
+                        Just ( b.id, d )
+
+                    else
+                        Nothing
+                )
+                model.buildings
+    in
+    closestId (unitTargets ++ buildingTargets)
+
+
+closestId : List ( Int, Float ) -> Maybe Int
+closestId pairs =
+    case List.sortBy Tuple.second pairs of
+        ( id, _ ) :: _ ->
+            Just id
+
+        [] ->
+            Nothing
+
+
+
+-- GATHERING ------------------------------------------------------------------------------------
+
+
+{-| Run every worker's gather loop for one tick and return the updated units plus the players with
+their gathered gold/wood added. Mirrors the single-player gather (walk to resource, fill to
+`carryCap`, haul back to the owner's base, deposit) but credits the worker's *owner*. -}
+runGather : Model -> ( List Unit, List Player )
+runGather model =
+    let
+        ( units2, gainsList ) =
+            List.foldr (gatherStep model) ( [], [] ) model.units
+
+        gains =
+            List.foldl (\( owner, g, w ) d -> Dict.update owner (\cur -> Just (addGain (Maybe.withDefault ( 0, 0 ) cur) g w)) d) Dict.empty gainsList
+
+        players2 =
+            List.map
+                (\p ->
+                    case Dict.get p.id gains of
+                        Just ( g, w ) ->
+                            { p | gold = p.gold + g, wood = p.wood + w }
+
+                        Nothing ->
+                            p
+                )
+                model.players
+    in
+    ( units2, players2 )
+
+
+addGain : ( Int, Int ) -> Int -> Int -> ( Int, Int )
+addGain ( g0, w0 ) g w =
+    ( g0 + g, w0 + w )
+
+
+gatherStep : Model -> Unit -> ( List Unit, List ( PlayerId, Int, Int ) ) -> ( List Unit, List ( PlayerId, Int, Int ) )
+gatherStep model u ( us, gains ) =
+    case u.kind of
+        Soldier ->
+            ( u :: us, gains )
+
+        Worker ->
+            if atOwnBase u model && u.carrying > 0 then
+                let
+                    ( dg, dw ) =
+                        depositValue u model
+                in
+                ( resume u :: us, ( u.owner, dg, dw ) :: gains )
+
+            else if u.carrying >= carryCap then
+                ( sendHome u model :: us, gains )
+
+            else if onAssignedResource u model then
+                ( { u | carrying = min carryCap (u.carrying + gatherRate) } :: us, gains )
+
+            else
+                ( u :: us, gains )
+
+
+depositValue : Unit -> Model -> ( Int, Int )
+depositValue u model =
     case u.assigned of
         Just ( ax, ay ) ->
             if isForestAt ax ay model then
@@ -490,43 +539,36 @@ deposit u model =
             ( u.carrying, 0 )
 
 
-isForestAt : Int -> Int -> Model -> Bool
-isForestAt x y model =
-    case lookupTerrain x y model of
-        Just terrain ->
-            isForest terrain
-
-        Nothing ->
-            False
-
-
-{-| Clears the load and walks back to the assigned resource (or waits if none). -}
 resume : Unit -> Unit
 resume u =
     case u.assigned of
         Just ( ax, ay ) ->
-            { u | carrying = 0, tx = toFloat ax, ty = toFloat ay }
+            { u | carrying = 0, tx = toFloat ax, ty = toFloat ay, path = [] }
 
         Nothing ->
             { u | carrying = 0 }
 
 
-{-| Targets the base so a full worker returns to unload. -}
 sendHome : Unit -> Model -> Unit
 sendHome u model =
-    case findBuilding isBase model of
-        Just ( bx, by ) ->
-            { u | tx = toFloat bx, ty = toFloat (by + 1) }
+    case ownBase u.owner model of
+        Just b ->
+            { u | tx = toFloat b.x, ty = toFloat (b.y + 1), path = pathTo model u ( b.x, b.y + 1 ) }
 
         Nothing ->
             u
 
 
-atBase : Unit -> Model -> Bool
-atBase u model =
-    case findBuilding isBase model of
-        Just ( bx, by ) ->
-            abs (round u.x - bx) <= 1 && abs (round u.y - by) <= 1
+pathTo : Model -> Unit -> ( Int, Int ) -> List ( Int, Int )
+pathTo model u goal =
+    findPath model ( round u.x, round u.y ) goal
+
+
+atOwnBase : Unit -> Model -> Bool
+atOwnBase u model =
+    case ownBase u.owner model of
+        Just b ->
+            abs (round u.x - b.x) <= 1 && abs (round u.y - b.y) <= 1
 
         Nothing ->
             False
@@ -542,60 +584,346 @@ onAssignedResource u model =
             False
 
 
-findBuilding : (BuildingKind -> Bool) -> Model -> Maybe ( Int, Int )
-findBuilding pred model =
-    List.head
-        (List.filterMap
-            (\b ->
-                if pred b.kind then
-                    Just ( b.x, b.y )
 
-                else
-                    Nothing
-            )
-            model.buildings
+-- FOG OF WAR -----------------------------------------------------------------------------------
+
+
+{-| Clear the human's fog around every friendly (human-owned) unit and building. The AI sees the
+whole board, so only player 0's vision matters here. -}
+revealFog : Model -> List Tile
+revealFog model =
+    let
+        sources =
+            List.filterMap
+                (\b ->
+                    if b.owner == humanId then
+                        Just ( b.x, b.y )
+
+                    else
+                        Nothing
+                )
+                model.buildings
+                ++ List.filterMap
+                    (\u ->
+                        if u.owner == humanId then
+                            Just ( round u.x, round u.y )
+
+                        else
+                            Nothing
+                    )
+                    model.units
+
+        near t ( sx, sy ) =
+            abs (t.x - sx) <= revealRadius && abs (t.y - sy) <= revealRadius
+    in
+    List.map
+        (\t ->
+            if t.visible || List.any (near t) sources then
+                { t | visible = True }
+
+            else
+                t
         )
+        model.map
 
 
 
--- Custom-type predicates (kept as case-matches rather than `==` on tagged values) -----------------
+-- QUERIES --------------------------------------------------------------------------------------
 
 
-isGold : Terrain -> Bool
-isGold t =
-    case t of
-        GoldMine ->
-            True
+player : PlayerId -> Model -> Maybe Player
+player pid model =
+    List.head (List.filter (\p -> p.id == pid) model.players)
+
+
+unitsOf : PlayerId -> Model -> List Unit
+unitsOf pid model =
+    List.filter (\u -> u.owner == pid) model.units
+
+
+buildingsOf : PlayerId -> Model -> List Building
+buildingsOf pid model =
+    List.filter (\b -> b.owner == pid) model.buildings
+
+
+ownBase : PlayerId -> Model -> Maybe Building
+ownBase pid model =
+    List.head (List.filter (\b -> b.owner == pid && b.kind == Base) model.buildings)
+
+
+findOwnBuilding : PlayerId -> BuildingKind -> Model -> Maybe Building
+findOwnBuilding pid kind model =
+    List.head (List.filter (\b -> b.owner == pid && b.kind == kind) model.buildings)
+
+
+countUnits : PlayerId -> UnitKind -> Model -> Int
+countUnits pid kind model =
+    List.length (List.filter (\u -> u.owner == pid && u.kind == kind) model.units)
+
+
+
+-- POWER ----------------------------------------------------------------------------------------
+
+
+{-| A player's "power": stockpiled resources plus the value of every unit and building it owns. -}
+playerPower : PlayerId -> Model -> Int
+playerPower pid model =
+    let
+        stock =
+            case player pid model of
+                Just p ->
+                    p.gold + p.wood
+
+                Nothing ->
+                    0
+
+        unitVal =
+            List.sum (List.map (\u -> unitPower u.kind) (unitsOf pid model))
+
+        buildingVal =
+            List.sum (List.map (\b -> buildingPower b.kind) (buildingsOf pid model))
+    in
+    stock + unitVal + buildingVal
+
+
+{-| A power snapshot of all players (in id order) at the current tick. -}
+sample : Model -> Sample
+sample model =
+    { tick = model.tick
+    , powers = List.map (\p -> playerPower p.id model) (List.sortBy .id model.players)
+    }
+
+
+
+-- DEFEAT ---------------------------------------------------------------------------------------
+
+
+{-| Mark any player with no buildings left as defeated. -}
+markDefeated : Model -> List Player
+markDefeated model =
+    List.map
+        (\p ->
+            if not p.defeated && List.isEmpty (buildingsOf p.id model) then
+                { p | defeated = True }
+
+            else
+                p
+        )
+        model.players
+
+
+livingPlayers : Model -> List Player
+livingPlayers model =
+    List.filter (\p -> not p.defeated) model.players
+
+
+
+-- COMMANDS (owner-parameterised) ---------------------------------------------------------------
+
+
+{-| Order a set of a player's units to a tile: clicking onto an enemy makes it an attack, onto a
+resource (for a worker) makes it a gather, otherwise a plain move. Units not owned by `pid` or not in
+`ids` are untouched. -}
+commandUnits : PlayerId -> List Int -> Int -> Int -> Model -> Model
+commandUnits pid ids x y model =
+    let
+        enemyHere =
+            enemyTargetAt pid x y model
+    in
+    { model
+        | units =
+            List.map
+                (\u ->
+                    if u.owner == pid && List.member u.id ids then
+                        case enemyHere of
+                            Just tid ->
+                                { u | attack = Just tid, assigned = Nothing, path = pathTo model u ( x, y ), tx = toFloat x, ty = toFloat y }
+
+                            Nothing ->
+                                orderMove x y model u
+
+                    else
+                        u
+                )
+                model.units
+    }
+
+
+{-| The id of an enemy unit or building standing on a tile (units first), if any. -}
+enemyTargetAt : PlayerId -> Int -> Int -> Model -> Maybe Int
+enemyTargetAt pid x y model =
+    case List.head (List.filter (\u -> u.owner /= pid && round u.x == x && round u.y == y) model.units) of
+        Just u ->
+            Just u.id
+
+        Nothing ->
+            case List.head (List.filter (\b -> b.owner /= pid && b.x == x && b.y == y) model.buildings) of
+                Just b ->
+                    Just b.id
+
+                Nothing ->
+                    Nothing
+
+
+orderMove : Int -> Int -> Model -> Unit -> Unit
+orderMove x y model u =
+    let
+        assigned =
+            if u.kind == Worker && isResourceAt x y model then
+                Just ( x, y )
+
+            else
+                Nothing
+    in
+    { u
+        | tx = toFloat x
+        , ty = toFloat y
+        , attack = Nothing
+        , assigned = assigned
+        , path = pathTo model u ( x, y )
+    }
+
+
+{-| Point all of a player's soldiers at a tile (an attack-move): used by the player's "send army"
+button and by the AI's pushes. -}
+attackMove : PlayerId -> Int -> Int -> Model -> Model
+attackMove pid x y model =
+    let
+        target =
+            enemyTargetAt pid x y model
+    in
+    { model
+        | units =
+            List.map
+                (\u ->
+                    if u.owner == pid && u.kind == Soldier then
+                        case target of
+                            Just tid ->
+                                { u | attack = Just tid, path = pathTo model u ( x, y ), tx = toFloat x, ty = toFloat y }
+
+                            Nothing ->
+                                orderMove x y model u
+
+                    else
+                        u
+                )
+                model.units
+    }
+
+
+
+-- TRAIN / BUILD --------------------------------------------------------------------------------
+
+
+{-| Spend a player's gold to spawn a unit next to a building of the right kind. -}
+spawnUnit : PlayerId -> UnitKind -> Int -> BuildingKind -> Model -> Model
+spawnUnit pid kind cost atKind model =
+    case ( findOwnBuilding pid atKind model, player pid model ) of
+        ( Just b, Just p ) ->
+            if p.gold < cost then
+                model
+
+            else
+                let
+                    spot =
+                        spawnSpot b model
+
+                    ( sx, sy ) =
+                        spot
+
+                    newUnit =
+                        { id = model.nextId
+                        , owner = pid
+                        , x = toFloat sx
+                        , y = toFloat sy
+                        , tx = toFloat sx
+                        , ty = toFloat sy
+                        , path = []
+                        , kind = kind
+                        , hp = maxHp kind
+                        , carrying = 0
+                        , assigned = Nothing
+                        , attack = Nothing
+                        , cooldown = 0
+                        }
+                in
+                { model
+                    | units = newUnit :: model.units
+                    , players = spend pid cost model.players
+                    , nextId = model.nextId + 1
+                }
 
         _ ->
-            False
+            model
 
 
-isForest : Terrain -> Bool
-isForest t =
-    case t of
-        Forest ->
-            True
+{-| A passable, unoccupied tile next to a building to spawn a unit on (falls back to just below it). -}
+spawnSpot : Building -> Model -> ( Int, Int )
+spawnSpot b model =
+    let
+        candidates =
+            [ ( b.x, b.y + 1 ), ( b.x + 1, b.y ), ( b.x - 1, b.y ), ( b.x, b.y - 1 ), ( b.x + 1, b.y + 1 ) ]
 
-        _ ->
-            False
+        ok ( x, y ) =
+            inBounds x y model && passableAt x y model && not (occupiedByBuilding x y model)
+    in
+    case List.head (List.filter ok candidates) of
+        Just spot ->
+            spot
 
-
-isBase : BuildingKind -> Bool
-isBase k =
-    case k of
-        Base ->
-            True
-
-        _ ->
-            False
+        Nothing ->
+            ( b.x, b.y + 1 )
 
 
-isBarracks : BuildingKind -> Bool
-isBarracks k =
-    case k of
+{-| Place a building for a player on a clear tile, spending the cost. -}
+placeBuilding : PlayerId -> BuildingKind -> Int -> Int -> Model -> Model
+placeBuilding pid kind x y model =
+    let
+        cost =
+            buildCost kind
+    in
+    case player pid model of
+        Just p ->
+            if p.gold < cost then
+                model
+
+            else if not (inBounds x y model) || not (passableAt x y model) || occupiedByBuilding x y model then
+                model
+
+            else
+                { model
+                    | buildings =
+                        { id = model.nextId, owner = pid, x = x, y = y, kind = kind, hp = buildingHp kind }
+                            :: model.buildings
+                    , players = spend pid cost model.players
+                    , nextId = model.nextId + 1
+                }
+
+        Nothing ->
+            model
+
+
+buildCost : BuildingKind -> Int
+buildCost kind =
+    case kind of
         Barracks ->
-            True
+            barracksCost
 
-        _ ->
-            False
+        Farm ->
+            farmCost
+
+        Base ->
+            barracksCost
+
+
+spend : PlayerId -> Int -> List Player -> List Player
+spend pid cost players =
+    List.map
+        (\p ->
+            if p.id == pid then
+                { p | gold = p.gold - cost }
+
+            else
+                p
+        )
+        players

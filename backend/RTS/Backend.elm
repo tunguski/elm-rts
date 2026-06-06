@@ -65,22 +65,32 @@ handle req =
             notFound
 
 
-{-| A JSON description of the world, built from the shared model constants and terrain palette. -}
+{-| A JSON description of the world, built from the shared model constants and terrain palette: the
+three selectable map sizes, the build/train costs, and the terrain colours. -}
 mapJson : String
 mapJson =
-    "{\"width\":"
-        ++ String.fromInt mapWidth
-        ++ ",\"height\":"
-        ++ String.fromInt mapHeight
-        ++ ",\"costs\":{\"worker\":"
+    "{\"sizes\":["
+        ++ String.join "," (List.map sizeEntry [ Small, Medium, Large ])
+        ++ "],\"costs\":{\"worker\":"
         ++ String.fromInt workerCost
         ++ ",\"soldier\":"
         ++ String.fromInt soldierCost
         ++ ",\"barracks\":"
         ++ String.fromInt barracksCost
+        ++ ",\"farm\":"
+        ++ String.fromInt farmCost
         ++ "},\"terrain\":["
         ++ String.join "," (List.map terrainEntry [ Grass, Forest, GoldMine, Water, Rock ])
         ++ "]}"
+
+
+sizeEntry : MapSize -> String
+sizeEntry size =
+    let
+        ( w, h ) =
+            sizeDims size
+    in
+    "{\"name\":\"" ++ sizeLabel size ++ "\",\"width\":" ++ String.fromInt w ++ ",\"height\":" ++ String.fromInt h ++ "}"
 
 
 terrainEntry : Terrain -> String
@@ -110,21 +120,21 @@ terrainName t =
 landingPage : String
 landingPage =
     String.join "\n"
-        [ "<!doctype html><html><head><meta charset=\"utf-8\"><title>RTS Mini</title>"
+        [ "<!doctype html><html><head><meta charset=\"utf-8\"><title>Elm RTS</title>"
         , "<style>body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;max-width:680px;margin:40px auto;padding:0 16px;line-height:1.6}code{background:#1e293b;padding:2px 6px;border-radius:4px}a{color:#60a5fa}</style></head><body>"
-        , "<h1>RTS Mini</h1>"
-        , "<p>A tiny real-time strategy game written in Elm. Build buildings, train units, gather"
-        , "resources and uncover the whole " ++ String.fromInt mapWidth ++ "&times;" ++ String.fromInt mapHeight ++ " map to win.</p>"
+        , "<h1>Elm RTS</h1>"
+        , "<p>A real-time strategy game written in Elm: pick a map size (S/M/L) and 0&ndash;2 AI"
+        , "opponents, build an economy, raise an army and crush every enemy base.</p>"
         , "<h2>How to play</h2>"
         , "<ul>"
-        , "<li>Click a unit to select it, then click a tile to move it.</li>"
+        , "<li>Click a unit to select it (or &ldquo;select whole army&rdquo;), then click a tile to move or an enemy to attack.</li>"
         , "<li>Move <b>workers</b> onto a gold mine or forest to gather gold/wood.</li>"
         , "<li>Train a worker at the base (" ++ String.fromInt workerCost ++ " gold).</li>"
-        , "<li>Build a barracks (" ++ String.fromInt barracksCost ++ " gold), then train soldiers (" ++ String.fromInt soldierCost ++ " gold).</li>"
-        , "<li>Reveal every tile to win — there is no enemy AI.</li>"
+        , "<li>Build a barracks (" ++ String.fromInt barracksCost ++ " gold), then train soldiers (" ++ String.fromInt soldierCost ++ " gold); a farm (" ++ String.fromInt farmCost ++ " gold) adds passive income.</li>"
+        , "<li>Beat the algorithmic AI opponents; afterwards see a rating and a power-history chart.</li>"
         , "</ul>"
         , "<p>Build the playable client with"
-        , "<code>elm make src/main/elm/rts/Main.elm --project src/main/elm/rts -o rts.html</code>.</p>"
+        , "<code>elm make src/RTS/Main.elm --project=elm.json -o build/rts.html</code>.</p>"
         , "<p>Machine-readable world data: <a href=\"/api/map\">/api/map</a>. Health check:"
         , "<a href=\"/ping\">/ping</a>.</p>"
         , "</body></html>"
