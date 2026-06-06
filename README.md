@@ -1,5 +1,7 @@
 # elm-rts — a real-time strategy game in Elm
 
+**▶ Play it live: <https://tunguski.github.io/elm-rts/>**
+
 A small but genuinely playable RTS (in the spirit of early WarCraft / Command & Conquer): pick a map
 size and a number of AI opponents, generate a fresh map, build an economy, raise an army, and fight
 to be the last base standing. After the match you get a **rating** and a **line chart of every
