@@ -1,5 +1,6 @@
 # Compiled output
 build/
+public/
 
 # elm tooling caches
 elm-stuff/
