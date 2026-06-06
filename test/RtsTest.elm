@@ -109,8 +109,38 @@ suite =
         , gatherTests
         , combatTests
         , aiTests
+        , fogTests
         , endToEndTests
         , ratingTests
+        ]
+
+
+fogTests : Test
+fogTests =
+    describe "Fog of war"
+        [ test "the enemy start is hidden while your own is revealed" <|
+            \_ ->
+                -- The view only draws enemy units/buildings on explored tiles, so at game start the
+                -- far-away enemy base must still be fogged while your own base is revealed.
+                let
+                    m =
+                        started Medium 1
+
+                    visibleAt x y =
+                        List.any (\t -> t.x == x && t.y == y && t.visible) m.map
+
+                    enemyBase =
+                        List.head (List.filter (\b -> b.owner /= humanId) m.buildings)
+
+                    humanBase =
+                        Logic.ownBase humanId m
+                in
+                case ( enemyBase, humanBase ) of
+                    ( Just e, Just h ) ->
+                        Expect.equal ( False, True ) ( visibleAt e.x e.y, visibleAt h.x h.y )
+
+                    _ ->
+                        Expect.fail "expected both a human and an enemy base"
         ]
 
 

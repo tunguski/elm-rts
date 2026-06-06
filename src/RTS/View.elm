@@ -13,6 +13,7 @@ import RTS.Chart as Chart
 import RTS.Logic as Logic
 import RTS.Model exposing (..)
 import RTS.Rating as Rating
+import Set exposing (Set)
 import Svg exposing (circle, rect, svg)
 import Svg.Attributes as SA
 
@@ -188,6 +189,10 @@ gameView model =
 
 battlefield : Model -> Html Msg
 battlefield model =
+    let
+        seen =
+            visibleCoords model
+    in
     svg
         [ SA.width (px (model.width * tileSize))
         , SA.height (px (model.height * tileSize))
@@ -197,9 +202,36 @@ battlefield model =
         , HA.style "max-width" "100%"
         ]
         (List.map tileRect model.map
-            ++ List.map buildingRect model.buildings
-            ++ List.concatMap (unitShapes model) model.units
+            ++ List.map buildingRect (List.filter (shownBuilding seen) model.buildings)
+            ++ List.concatMap (unitShapes model) (List.filter (shownUnit seen) model.units)
         )
+
+
+{-| The set of tiles the human has explored (fog cleared). -}
+visibleCoords : Model -> Set ( Int, Int )
+visibleCoords model =
+    List.foldl
+        (\t s ->
+            if t.visible then
+                Set.insert ( t.x, t.y ) s
+
+            else
+                s
+        )
+        Set.empty
+        model.map
+
+
+{-| Your own units/buildings are always drawn; an enemy's is hidden until you've explored its tile,
+so nothing shows through the fog of war. -}
+shownUnit : Set ( Int, Int ) -> Unit -> Bool
+shownUnit seen u =
+    u.owner == humanId || Set.member ( round u.x, round u.y ) seen
+
+
+shownBuilding : Set ( Int, Int ) -> Building -> Bool
+shownBuilding seen b =
+    b.owner == humanId || Set.member ( b.x, b.y ) seen
 
 
 tileRect : Tile -> Html Msg
@@ -455,6 +487,9 @@ minimap model =
     let
         scale =
             max 3 (180 // max 1 model.width)
+
+        seen =
+            visibleCoords model
     in
     svg
         [ SA.width (px (model.width * scale))
@@ -463,8 +498,8 @@ minimap model =
         , HA.style "border-radius" "6px"
         ]
         (List.map (miniTile scale) model.map
-            ++ List.map (miniBuilding scale) model.buildings
-            ++ List.map (miniUnit scale) model.units
+            ++ List.map (miniBuilding scale) (List.filter (shownBuilding seen) model.buildings)
+            ++ List.map (miniUnit scale) (List.filter (shownUnit seen) model.units)
         )
 
 
