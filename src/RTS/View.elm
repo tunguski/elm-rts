@@ -181,18 +181,19 @@ smallButton label msg =
 
 gameView : Model -> Html Msg
 gameView model =
-    div [ HA.style "display" "flex", HA.style "gap" "16px", HA.style "flex-wrap" "wrap", HA.style "align-items" "flex-start" ]
-        [ battlefield model
-        , hud model
-        ]
-
-
-battlefield : Model -> Html Msg
-battlefield model =
     let
+        -- Explored-tile set computed once and shared by the battlefield and the minimap.
         seen =
             visibleCoords model
     in
+    div [ HA.style "display" "flex", HA.style "gap" "16px", HA.style "flex-wrap" "wrap", HA.style "align-items" "flex-start" ]
+        [ battlefield seen model
+        , hud seen model
+        ]
+
+
+battlefield : Set ( Int, Int ) -> Model -> Html Msg
+battlefield seen model =
     svg
         [ SA.width (px (model.width * tileSize))
         , SA.height (px (model.height * tileSize))
@@ -366,8 +367,8 @@ healthColor frac =
 -- HUD ------------------------------------------------------------------------------------------
 
 
-hud : Model -> Html Msg
-hud model =
+hud : Set ( Int, Int ) -> Model -> Html Msg
+hud seen model =
     div
         [ HA.style "min-width" "260px"
         , HA.style "max-width" "300px"
@@ -397,7 +398,7 @@ hud model =
         , div [ HA.style "min-height" "20px", HA.style "font-size" "13px", HA.style "color" "#cbd5e1" ] [ text model.message ]
         , divider
         , sectionTitle "Minimap"
-        , minimap model
+        , minimap seen model
         , divider
         , legend
         ]
@@ -482,14 +483,11 @@ standingRow p power maxP =
 -- MINIMAP --------------------------------------------------------------------------------------
 
 
-minimap : Model -> Html Msg
-minimap model =
+minimap : Set ( Int, Int ) -> Model -> Html Msg
+minimap seen model =
     let
         scale =
             max 3 (180 // max 1 model.width)
-
-        seen =
-            visibleCoords model
     in
     svg
         [ SA.width (px (model.width * scale))

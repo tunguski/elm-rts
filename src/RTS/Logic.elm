@@ -99,7 +99,12 @@ isForestAt x y model =
 {-| A breadth-first shortest path of tiles from `start` to `goal` (4-directional), excluding `start`
 and ending at `goal`. Impassable terrain and tiles occupied by buildings are avoided, except the goal
 itself is always allowed (so a worker can path onto a resource and a soldier onto an enemy building).
-Returns `[]` when no path exists. Exploration is bounded so a sealed-off goal can't loop forever. -}
+Returns `[]` when no path exists. Exploration is bounded so a sealed-off goal can't loop forever.
+
+The blocked tiles are gathered into a `Set` *once* per call (so a per-node passability check is a
+`Set` lookup, not an O(map)/O(buildings) rescan), and the search runs level-by-level with a
+`came-from` map rather than appending to a list-queue, keeping the whole thing roughly O(tiles)
+instead of the former O(nodes · map). -}
 findPath : Model -> ( Int, Int ) -> ( Int, Int ) -> List ( Int, Int )
 findPath model start goal =
     if start == goal then
@@ -107,44 +112,91 @@ findPath model start goal =
 
     else
         let
-            walkable pos =
-                pos == goal || passableTile model pos
+            blocked =
+                blockedTiles model
+
+            walkable ( x, y ) =
+                x >= 0 && x < model.width && y >= 0 && y < model.height && (( x, y ) == goal || not (Set.member ( x, y ) blocked))
+
+            cameFrom =
+                bfsLevels goal walkable start [ start ] Dict.empty 8000
         in
-        bfs goal walkable [ ( start, [] ) ] (Set.singleton start) 3000
+        if Dict.member goal cameFrom then
+            reconstruct cameFrom start goal []
 
-
-passableTile : Model -> ( Int, Int ) -> Bool
-passableTile model ( x, y ) =
-    inBounds x y model && passableAt x y model && not (occupiedByBuilding x y model)
-
-
-bfs : ( Int, Int ) -> (( Int, Int ) -> Bool) -> List ( ( Int, Int ), List ( Int, Int ) ) -> Set ( Int, Int ) -> Int -> List ( Int, Int )
-bfs goal walkable queue visited budget =
-    case queue of
-        [] ->
+        else
             []
 
-        ( tile, pathRev ) :: rest ->
-            if tile == goal then
-                List.reverse pathRev
 
-            else if budget <= 0 then
-                []
+{-| Impassable tiles: terrain that blocks movement, plus every building footprint. Built once per
+pathfind. -}
+blockedTiles : Model -> Set ( Int, Int )
+blockedTiles model =
+    let
+        terrainBlocked =
+            List.foldl
+                (\t s ->
+                    if passableTerrain t.terrain then
+                        s
+
+                    else
+                        Set.insert ( t.x, t.y ) s
+                )
+                Set.empty
+                model.map
+    in
+    List.foldl (\b s -> Set.insert ( b.x, b.y ) s) terrainBlocked model.buildings
+
+
+{-| Level-order BFS: expand the whole current frontier, recording each newly reached tile's parent in
+`cameFrom`, then recurse on the next frontier. Stops once the goal is reached, the frontier empties,
+or the node budget is spent. -}
+bfsLevels : ( Int, Int ) -> (( Int, Int ) -> Bool) -> ( Int, Int ) -> List ( Int, Int ) -> Dict ( Int, Int ) ( Int, Int ) -> Int -> Dict ( Int, Int ) ( Int, Int )
+bfsLevels goal walkable start frontier cameFrom budget =
+    if Dict.member goal cameFrom || budget <= 0 then
+        cameFrom
+
+    else
+        let
+            ( next, cameFrom2 ) =
+                List.foldl (expandFrom walkable start) ( [], cameFrom ) frontier
+        in
+        case next of
+            [] ->
+                cameFrom2
+
+            _ ->
+                bfsLevels goal walkable start next cameFrom2 (budget - List.length next)
+
+
+expandFrom : (( Int, Int ) -> Bool) -> ( Int, Int ) -> ( Int, Int ) -> ( List ( Int, Int ), Dict ( Int, Int ) ( Int, Int ) ) -> ( List ( Int, Int ), Dict ( Int, Int ) ( Int, Int ) )
+expandFrom walkable start cell ( acc, cameFrom ) =
+    List.foldl
+        (\n ( a, cf ) ->
+            if n /= start && walkable n && not (Dict.member n cf) then
+                ( n :: a, Dict.insert n cell cf )
 
             else
-                let
-                    ns =
-                        List.filter
-                            (\n -> walkable n && not (Set.member n visited))
-                            (neighbors4 tile)
+                ( a, cf )
+        )
+        ( acc, cameFrom )
+        (neighbors4 cell)
 
-                    visited2 =
-                        List.foldl Set.insert visited ns
 
-                    queue2 =
-                        rest ++ List.map (\n -> ( n, n :: pathRev )) ns
-                in
-                bfs goal walkable queue2 visited2 (budget - 1)
+{-| Walk the `came-from` map back from `goal` to `start`, producing the path forward and excluding
+`start`. -}
+reconstruct : Dict ( Int, Int ) ( Int, Int ) -> ( Int, Int ) -> ( Int, Int ) -> List ( Int, Int ) -> List ( Int, Int )
+reconstruct cameFrom start cur acc =
+    if cur == start then
+        acc
+
+    else
+        case Dict.get cur cameFrom of
+            Just parent ->
+                reconstruct cameFrom start parent (cur :: acc)
+
+            Nothing ->
+                acc
 
 
 neighbors4 : ( Int, Int ) -> List ( Int, Int )
@@ -157,17 +209,22 @@ neighbors4 ( x, y ) =
 
 
 {-| Advance every unit one step: chasers head for (and stop in range of) their target, others follow
-their stored path toward `tx`/`ty`. -}
+their stored path toward `tx`/`ty`. The id→position map is built once and shared, so a chaser's
+target lookup is a `Dict` hit rather than a full units+buildings rescan. -}
 moveUnits : Model -> List Unit
 moveUnits model =
-    List.map (stepUnit model) model.units
+    let
+        pos =
+            posDict model
+    in
+    List.map (stepUnit model pos) model.units
 
 
-stepUnit : Model -> Unit -> Unit
-stepUnit model u =
+stepUnit : Model -> Dict Int ( Float, Float ) -> Unit -> Unit
+stepUnit model pos u =
     case u.attack of
         Just tid ->
-            case targetPos tid model of
+            case Dict.get tid pos of
                 Just ( txp, typ ) ->
                     if distance u.x u.y txp typ <= attackRange u.kind then
                         -- In range: hold position and let combat do the rest.
@@ -241,10 +298,22 @@ homeIn u =
 
 
 type alias Hit =
-    { target : Int
+    { attacker : Int
+    , target : Int
     , owner : PlayerId
     , dmg : Int
     }
+
+
+{-| The id→position map of every unit and building, built once per tick and shared by combat and
+movement so target lookups are `Dict` hits instead of full list rescans. -}
+posDict : Model -> Dict Int ( Float, Float )
+posDict model =
+    let
+        withUnits =
+            List.foldl (\u d -> Dict.insert u.id ( u.x, u.y ) d) Dict.empty model.units
+    in
+    List.foldl (\b d -> Dict.insert b.id ( toFloat b.x, toFloat b.y ) d) withUnits model.buildings
 
 
 {-| Resolve one tick of combat: every unit whose attack is off cooldown and whose target is in range
@@ -253,8 +322,14 @@ and the players with kill counts credited for anything destroyed this tick. -}
 resolveCombat : Model -> ( List Unit, List Building, List Player )
 resolveCombat model =
     let
+        pos =
+            posDict model
+
         hits =
-            List.filterMap (attackHit model) model.units
+            List.filterMap (attackHit pos) model.units
+
+        firedSet =
+            Set.fromList (List.map .attacker hits)
 
         dmgByTarget =
             List.foldl (\h d -> Dict.update h.target (\cur -> Just (Maybe.withDefault 0 cur + h.dmg)) d) Dict.empty hits
@@ -268,7 +343,7 @@ resolveCombat model =
                 (\u ->
                     let
                         cooled =
-                            if memberFired u.id model hits then
+                            if Set.member u.id firedSet then
                                 { u | cooldown = attackCooldown u.kind }
 
                             else
@@ -317,20 +392,20 @@ resolveCombat model =
     ( units2, buildings2, players2 )
 
 
-{-| The damage event a unit produces this tick, if any: it must have a target, be off cooldown, and
-have that target within strike range. -}
-attackHit : Model -> Unit -> Maybe Hit
-attackHit model u =
+{-| The damage event a unit produces this tick, if any: it must have a target (looked up in the
+shared position map), be off cooldown, and have that target within strike range. -}
+attackHit : Dict Int ( Float, Float ) -> Unit -> Maybe Hit
+attackHit pos u =
     case u.attack of
         Just tid ->
             if u.cooldown > 0 then
                 Nothing
 
             else
-                case targetPos tid model of
+                case Dict.get tid pos of
                     Just ( tx, ty ) ->
                         if distance u.x u.y tx ty <= attackRange u.kind then
-                            Just { target = tid, owner = u.owner, dmg = attackDamage u.kind }
+                            Just { attacker = u.id, target = tid, owner = u.owner, dmg = attackDamage u.kind }
 
                         else
                             Nothing
@@ -340,28 +415,6 @@ attackHit model u =
 
         Nothing ->
             Nothing
-
-
-memberFired : Int -> Model -> List Hit -> Bool
-memberFired uid model hits =
-    -- A unit "fired" if it produced a hit this tick (so its cooldown resets).
-    List.any (\u -> u.id == uid) (List.filter (\u -> attackHit model u /= Nothing) model.units)
-
-
-{-| The world position of a target id, whether it's a unit or a building. -}
-targetPos : Int -> Model -> Maybe ( Float, Float )
-targetPos tid model =
-    case List.head (List.filter (\u -> u.id == tid) model.units) of
-        Just u ->
-            Just ( u.x, u.y )
-
-        Nothing ->
-            case List.head (List.filter (\b -> b.id == tid) model.buildings) of
-                Just b ->
-                    Just ( toFloat b.x, toFloat b.y )
-
-                Nothing ->
-                    Nothing
 
 
 deaths : List Unit -> List Unit -> List Int
