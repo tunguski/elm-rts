@@ -110,8 +110,89 @@ suite =
         , combatTests
         , aiTests
         , fogTests
+        , siegeTests
         , endToEndTests
         , ratingTests
+        ]
+
+
+siegeTests : Test
+siegeTests =
+    describe "Sieging a base"
+        [ test "findPath reaches an enemy base tile (a blocked building)" <|
+            \_ ->
+                let
+                    m =
+                        started Medium 1
+
+                    humanBase =
+                        Logic.ownBase humanId m
+
+                    aiBase =
+                        List.head (List.filter (\b -> b.owner /= humanId && b.kind == Base) m.buildings)
+
+                    path =
+                        case ( humanBase, aiBase ) of
+                            ( Just h, Just e ) ->
+                                Logic.findPath m ( h.x, h.y + 1 ) ( e.x, e.y )
+
+                            _ ->
+                                []
+
+                    endsAtBase =
+                        case ( List.head (List.reverse path), aiBase ) of
+                            ( Just last, Just e ) ->
+                                last == ( e.x, e.y )
+
+                            _ ->
+                                False
+                in
+                Expect.equal True (not (List.isEmpty path) && endsAtBase)
+        , test "selecting the army and clicking the enemy base attacks it (no hang)" <|
+            \_ ->
+                -- The exact player action that triggered the freeze: army selected, click the enemy
+                -- base (a blocked building). The soldiers cross the map, besiege it and damage it.
+                let
+                    m0 =
+                        started Medium 1
+
+                    humanBase =
+                        Logic.ownBase humanId m0
+
+                    aiBase =
+                        List.head (List.filter (\b -> b.owner /= humanId && b.kind == Base) m0.buildings)
+
+                    sieged =
+                        case ( humanBase, aiBase ) of
+                            ( Just h, Just e ) ->
+                                let
+                                    army =
+                                        List.map (\i -> soldier (8000 + i) humanId (toFloat h.x) (toFloat (h.y + 1)) Nothing) (List.range 0 11)
+                                in
+                                { m0 | units = army ++ m0.units }
+                                    |> send SelectArmy
+                                    |> send (ClickTile e.x e.y)
+
+                            _ ->
+                                m0
+
+                    after =
+                        runTicks 500 sieged
+
+                    damagedOrGone =
+                        case List.head (List.filter (\b -> b.owner /= humanId && b.kind == Base) after.buildings) of
+                            Nothing ->
+                                True
+
+                            Just b ->
+                                b.hp < buildingHp Base
+                in
+                Expect.equal True damagedOrGone
+        , test "a full 1v1 always reaches a result by the tick limit (never hangs)" <|
+            \_ ->
+                -- Past the tick limit the match is decided on power, so a game must always terminate;
+                -- run a real 1v1 (with AI armies sieging) to be sure it does and stays cheap.
+                Expect.equal ResultScreen (runTicks 1300 (started Small 1)).screen
         ]
 
 

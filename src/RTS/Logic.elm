@@ -242,7 +242,10 @@ stepUnit model pos u =
 
 
 {-| Keep a chaser's path pointed at its (moving) target: recompute when the path is empty or on a
-staggered cadence, so a long chase isn't re-planned every single tick. -}
+staggered cadence, so a long chase isn't re-planned every single tick. If the target turns out to be
+unreachable (no path at all), the unit *gives up* — it drops the attack order instead of running a
+fresh full-map search every single tick (which is what would make a hard-to-reach base assault crawl).
+`autoAcquire` will re-engage if a target later comes within range. -}
 ensureChasePath : Model -> Unit -> ( Int, Int ) -> Unit
 ensureChasePath model u goal =
     let
@@ -250,7 +253,12 @@ ensureChasePath model u goal =
             List.isEmpty u.path || modBy 8 (model.tick + u.id) == 0
     in
     if due then
-        { u | path = findPath model ( round u.x, round u.y ) goal, tx = toFloat (Tuple.first goal), ty = toFloat (Tuple.second goal) }
+        case findPath model ( round u.x, round u.y ) goal of
+            [] ->
+                { u | attack = Nothing, path = [], tx = u.x, ty = u.y }
+
+            p ->
+                { u | path = p, tx = toFloat (Tuple.first goal), ty = toFloat (Tuple.second goal) }
 
     else
         u
