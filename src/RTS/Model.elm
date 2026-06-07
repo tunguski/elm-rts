@@ -53,6 +53,8 @@ across all three. Several map dimensions that used to be top-level constants now
 because the player picks the map size (S/M/L) before each match.
 -}
 
+import Set exposing (Set)
+
 
 {-| Which player a unit or building belongs to. `0` is always the human; `1` and `2` are AI. -}
 type alias PlayerId =
@@ -72,6 +74,10 @@ type alias Model =
     , width : Int
     , height : Int
     , map : List Tile
+
+    -- Impassable terrain coordinates, computed once when the map is generated (terrain never
+    -- changes), so pathfinding doesn't rescan the whole map every call.
+    , terrainBlocked : Set ( Int, Int )
     , units : List Unit
     , buildings : List Building
     , players : List Player

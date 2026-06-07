@@ -112,8 +112,10 @@ findPath model start goal =
 
     else
         let
+            -- The static impassable-terrain set is precomputed in the model; only the (small,
+            -- changing) set of building footprints is added per call.
             blocked =
-                blockedTiles model
+                List.foldl (\b s -> Set.insert ( b.x, b.y ) s) model.terrainBlocked model.buildings
 
             walkable ( x, y ) =
                 x >= 0 && x < model.width && y >= 0 && y < model.height && (( x, y ) == goal || not (Set.member ( x, y ) blocked))
@@ -128,24 +130,20 @@ findPath model start goal =
             []
 
 
-{-| Impassable tiles: terrain that blocks movement, plus every building footprint. Built once per
-pathfind. -}
-blockedTiles : Model -> Set ( Int, Int )
-blockedTiles model =
-    let
-        terrainBlocked =
-            List.foldl
-                (\t s ->
-                    if passableTerrain t.terrain then
-                        s
+{-| The set of impassable-terrain coordinates for a generated tile list. Computed once at game start
+and stored in the model (terrain never changes), so `findPath` doesn't rescan the whole map. -}
+terrainBlockedSet : List Tile -> Set ( Int, Int )
+terrainBlockedSet tiles =
+    List.foldl
+        (\t s ->
+            if passableTerrain t.terrain then
+                s
 
-                    else
-                        Set.insert ( t.x, t.y ) s
-                )
-                Set.empty
-                model.map
-    in
-    List.foldl (\b s -> Set.insert ( b.x, b.y ) s) terrainBlocked model.buildings
+            else
+                Set.insert ( t.x, t.y ) s
+        )
+        Set.empty
+        tiles
 
 
 {-| Level-order BFS: expand the whole current frontier, recording each newly reached tile's parent in
@@ -650,9 +648,61 @@ onAssignedResource u model =
 
 
 {-| Clear the human's fog around every friendly (human-owned) unit and building. The AI sees the
-whole board, so only player 0's vision matters here. -}
+whole board, so only player 0's vision matters here.
+
+Two things matter for performance: it is O(map + sources·radius²) rather than O(map · sources) — the
+vision region is gathered into a `Set` first — and, crucially, when nothing new is revealed this tick
+it returns the *same* `map` list (by reference). That lets the view's lazy tile layer skip rebuilding
+~width·height SVG nodes on the (common, once explored) ticks where the fog doesn't change. -}
 revealFog : Model -> List Tile
 revealFog model =
+    let
+        visible =
+            List.foldl
+                (\t s ->
+                    if t.visible then
+                        Set.insert ( t.x, t.y ) s
+
+                    else
+                        s
+                )
+                Set.empty
+                model.map
+
+        region =
+            humanVisionRegion model
+
+        newly =
+            Set.foldl
+                (\c acc ->
+                    if Set.member c visible then
+                        acc
+
+                    else
+                        Set.insert c acc
+                )
+                Set.empty
+                region
+    in
+    if Set.isEmpty newly then
+        -- Nothing changed: keep the same list so the lazy tile layer can skip a full re-render.
+        model.map
+
+    else
+        List.map
+            (\t ->
+                if Set.member ( t.x, t.y ) newly then
+                    { t | visible = True }
+
+                else
+                    t
+            )
+            model.map
+
+
+{-| Every in-bounds tile within `revealRadius` (Chebyshev) of a human unit or building. -}
+humanVisionRegion : Model -> Set ( Int, Int )
+humanVisionRegion model =
     let
         sources =
             List.filterMap
@@ -674,18 +724,28 @@ revealFog model =
                     )
                     model.units
 
-        near t ( sx, sy ) =
-            abs (t.x - sx) <= revealRadius && abs (t.y - sy) <= revealRadius
-    in
-    List.map
-        (\t ->
-            if t.visible || List.any (near t) sources then
-                { t | visible = True }
+        addAround ( sx, sy ) acc =
+            List.foldl
+                (\dy a2 ->
+                    List.foldl
+                        (\dx a3 ->
+                            let
+                                c =
+                                    ( sx + dx, sy + dy )
+                            in
+                            if inBounds (sx + dx) (sy + dy) model then
+                                Set.insert c a3
 
-            else
-                t
-        )
-        model.map
+                            else
+                                a3
+                        )
+                        a2
+                        (List.range -revealRadius revealRadius)
+                )
+                acc
+                (List.range -revealRadius revealRadius)
+    in
+    List.foldl addAround Set.empty sources
 
 
 
@@ -747,11 +807,32 @@ playerPower pid model =
     stock + unitVal + buildingVal
 
 
+{-| Every player's power in one pass over the units and buildings (keyed by owner), instead of a
+fresh per-player scan. Used by the HUD standings (every render) and the history snapshot. -}
+powerByPlayer : Model -> Dict PlayerId Int
+powerByPlayer model =
+    let
+        bump pid amount d =
+            Dict.update pid (\cur -> Just (Maybe.withDefault 0 cur + amount)) d
+
+        withStock =
+            List.foldl (\p d -> bump p.id (p.gold + p.wood) d) Dict.empty model.players
+
+        withUnits =
+            List.foldl (\u d -> bump u.owner (unitPower u.kind) d) withStock model.units
+    in
+    List.foldl (\b d -> bump b.owner (buildingPower b.kind) d) withUnits model.buildings
+
+
 {-| A power snapshot of all players (in id order) at the current tick. -}
 sample : Model -> Sample
 sample model =
+    let
+        powers =
+            powerByPlayer model
+    in
     { tick = model.tick
-    , powers = List.map (\p -> playerPower p.id model) (List.sortBy .id model.players)
+    , powers = List.map (\p -> Maybe.withDefault 0 (Dict.get p.id powers)) (List.sortBy .id model.players)
     }
 
 

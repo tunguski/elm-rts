@@ -12,6 +12,7 @@ import RTS.Logic as Logic
 import RTS.Map as Map
 import RTS.Model exposing (..)
 import RTS.Rng as Rng
+import Set
 
 
 startGold : Int
@@ -55,6 +56,7 @@ init =
     , width = 0
     , height = 0
     , map = []
+    , terrainBlocked = Set.empty
     , units = []
     , buildings = []
     , players = []
@@ -423,6 +425,7 @@ startGame model =
                 , width = gen.width
                 , height = gen.height
                 , map = gen.tiles
+                , terrainBlocked = Logic.terrainBlockedSet gen.tiles
                 , units = units
                 , buildings = buildings
                 , players = players

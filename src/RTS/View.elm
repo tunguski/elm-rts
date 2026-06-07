@@ -9,12 +9,14 @@ scoreboard, and the power-history line chart). Pure: it reads the model and emit
 import Html exposing (Html, button, div, span, table, td, text, th, tr)
 import Html.Attributes as HA
 import Html.Events exposing (onClick)
+import Html.Lazy
 import RTS.Chart as Chart
 import RTS.Logic as Logic
 import RTS.Model exposing (..)
+import Dict
 import RTS.Rating as Rating
 import Set exposing (Set)
-import Svg exposing (circle, rect, svg)
+import Svg exposing (circle, g, rect, svg)
 import Svg.Attributes as SA
 
 
@@ -202,10 +204,18 @@ battlefield seen model =
         , HA.style "box-shadow" "0 10px 40px rgba(0,0,0,0.5)"
         , HA.style "max-width" "100%"
         ]
-        (List.map tileRect model.map
-            ++ List.map buildingRect (List.filter (shownBuilding seen) model.buildings)
+        (Html.Lazy.lazy tileLayer model.map
+            :: List.map buildingRect (List.filter (shownBuilding seen) model.buildings)
             ++ List.concatMap (unitShapes model) (List.filter (shownUnit seen) model.units)
         )
+
+
+{-| The terrain/fog layer as a single group, memoised on `model.map`: `revealFog` keeps the same list
+reference on ticks where nothing is newly revealed, so this whole ~width·height-node layer is skipped
+by the lazy diff until the fog actually changes. -}
+tileLayer : List Tile -> Html Msg
+tileLayer tiles =
+    g [] (List.map tileRect tiles)
 
 
 {-| The set of tiles the human has explored (fog cleared). -}
@@ -440,14 +450,18 @@ standings model =
         rows =
             List.sortBy .id model.players
 
-        powers =
-            List.map (\p -> Logic.playerPower p.id model) rows
+        -- One pass over units/buildings for every player's power, rather than a scan per player.
+        powerOf =
+            Logic.powerByPlayer model
+
+        power p =
+            Maybe.withDefault 0 (Dict.get p.id powerOf)
 
         maxP =
-            List.maximum powers |> Maybe.withDefault 1 |> max 1
+            List.maximum (List.map power rows) |> Maybe.withDefault 1 |> max 1
     in
     div [ HA.style "display" "flex", HA.style "flex-direction" "column", HA.style "gap" "6px" ]
-        (List.map (\p -> standingRow p (Logic.playerPower p.id model) maxP) rows)
+        (List.map (\p -> standingRow p (power p) maxP) rows)
 
 
 standingRow : Player -> Int -> Int -> Html Msg
@@ -495,10 +509,16 @@ minimap seen model =
         , HA.style "background" "#020617"
         , HA.style "border-radius" "6px"
         ]
-        (List.map (miniTile scale) model.map
-            ++ List.map (miniBuilding scale) (List.filter (shownBuilding seen) model.buildings)
+        (Html.Lazy.lazy2 miniTileLayer scale model.map
+            :: List.map (miniBuilding scale) (List.filter (shownBuilding seen) model.buildings)
             ++ List.map (miniUnit scale) (List.filter (shownUnit seen) model.units)
         )
+
+
+{-| The minimap's terrain/fog layer, memoised on (scale, map) just like the main tile layer. -}
+miniTileLayer : Int -> List Tile -> Html Msg
+miniTileLayer scale tiles =
+    g [] (List.map (miniTile scale) tiles)
 
 
 miniTile : Int -> Tile -> Html Msg
