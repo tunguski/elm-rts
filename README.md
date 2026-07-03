@@ -85,9 +85,6 @@ elm test test/RtsTest.elm \
   src/RTS/Ai.elm src/RTS/Rating.elm src/RTS/Game.elm
 ```
 
-(elm-lang's own build additionally runs the game under its interpreter — see `RtsGameTest` — to guard
-the example against language changes.)
-
 ### Backend (optional)
 
 The backend is a `handle : Request -> Response` (plus a stateful `onRequest` for save/load) that
